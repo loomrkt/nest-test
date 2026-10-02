@@ -1,13 +1,9 @@
-import { lookup } from 'dns';
-import { promisify } from 'util';
+import { lookup } from 'dns/promises';
 
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
 export { ConfigModule, ConfigService };
-
-const resolveIpv4 = promisify(lookup);
-
 export const typeOrmModule = TypeOrmModule.forRootAsync({
   imports: [ConfigModule],
   inject: [ConfigService],
@@ -15,21 +11,28 @@ export const typeOrmModule = TypeOrmModule.forRootAsync({
     const databaseUrl = config.get<string>('DATABASE_URL');
     if (databaseUrl) {
       const url = new URL(databaseUrl);
-      // Force IPv4: the pg driver keeps the first DNS answer, and on hosts
-      // without working IPv6 connectivity that is a fast failure (ETIMEDOUT).
-      // Neon requires SNI, so we keep the hostname for the TLS handshake and
-      // only pin the resolved IPv4 address via the libpq `hostaddr` param.
-      if (!url.searchParams.has('hostaddr')) {
-        const ipv4 = await resolveIpv4(url.hostname, { type: 'A' });
-        url.searchParams.set('hostaddr', ipv4);
+      // The pg driver keeps the first DNS answer: on hosts where IPv6 is
+      // returned first, the pooler connection dies with a fast ETIMEDOUT
+      // before any fallback. We resolve an IPv4 address ourselves and
+      // connect to it directly.
+      const { address } = await lookup(url.hostname, { family: 4 });
+      const options = ['-c timezone=UTC'];
+      if (url.hostname.endsWith('.neon.tech')) {
+        // Neon's pooler requires the endpoint ID (first label of the
+        // hostname) when the TLS SNI cannot carry it (IP connection).
+        options.push(`endpoint=${url.hostname.split('.')[0]}`);
       }
       return {
         type: 'postgres',
-        url: url.toString(),
+        host: address,
+        port: Number(url.port ?? 5432),
+        database: url.pathname.slice(1),
+        username: url.username ? decodeURIComponent(url.username) : undefined,
+        password: url.password ? decodeURIComponent(url.password) : undefined,
         ssl: { rejectUnauthorized: false },
         autoLoadEntities: true,
         synchronize: config.get('NODE_ENV') !== 'production',
-        extra: { options: '-c timezone=UTC' },
+        extra: { options: options.join(' ') },
       };
     }
     return {
